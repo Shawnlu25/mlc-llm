@@ -9,20 +9,26 @@ from tvm.relax.testing import nn
 
 @dataclass
 class BaichuanConfig:
-    dtype: str = "float16"
-    vocab_size: int = 125696
-    word_embed: int = 4096
+    vocab_size: int = 64000
+    hidden_size: int = 5120
+    intermediate_size: int = 13696
+    num_hidden_layers: int = 40
+    num_attention_heads: int = 40
+    hidden_act: str = "silu"
+    model_max_length: int = 4096
+    initializer_range: float = 0.02
     rms_norm_eps: float = 1e-6
+    use_cache: bool = True
+    pad_token_id: int = 0
+    bos_token_id: int = 1
+    eos_token_id: int = 2
+    tie_word_embeddings: bool = False
+    gradient_checkpointing: bool = False
+    z_loss_weight: int = 0
 
-MODEL_CONFIG = {
-    "Baichuan2-7B-Chat": {}
-}
 
 class BaichuanRMSNorm(nn.Module):
     def __init__(self, hidden_size, epsilon=1e-6):
-        super().__init__()
-
-        # TODO: Is it necessary to name it?
         self.weight = nn.Parameter((hidden_size, ), dtype="float32", name="baichuan_rmsnorm_weight")
         self.epsilon = tvm.tir.const(epsilon, dtype="float32", name="baichuan_rmsnorm_eps")
     
@@ -40,6 +46,9 @@ class BaichuanMLP(nn.Module):
     def forward(self, x: relax.Expr) -> relax.Var:
         return nn.emit(relax.op.linear(relax.op.nn.silu(relax.op.linear(x, self.gate_proj)) * relax.op.linear(x, self.up_proj), self.down_proj))
     
+
+
+
 
 def build_relax(nn_module) -> tvm.ir.IRModule:
     # relax.BlockBuilder can construct end-to-end models step by step in an IRModule that starts empty
