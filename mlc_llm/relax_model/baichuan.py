@@ -233,15 +233,17 @@ def build_relax(nn_module) -> tvm.ir.IRModule:
     # create a function called `linear` in the IRModule
     with bb.function("main"):
         # define input placeholder to the relax nn module
-        hidden_states = nn.Placeholder((2, 4096, 5120), dtype="float32", name="hidden_states")
+        hidden_states = nn.Placeholder((2, 1024, 5120), dtype="float32", name="hidden_states")
+        past_key = nn.Placeholder((2, 40, 64, 128), dtype="float32", name="past_key")
+        past_value = nn.Placeholder((2, 40, 64, 128), dtype="float32", name="past_value")
         #attention_mask = nn.Placeholder((2, 4096, 4096), dtype="float32", name="attention_mask")
 
         # build dataflow block
         with bb.dataflow():
             # call forward function of relax nn module to build IRModule
-            output = model(hidden_states, None, None)
+            output = model(hidden_states, None, (past_key, past_value), use_cache=True)
             # The params of the constructed IRModule
-            params = [hidden_states] + model.parameters()
+            params = [hidden_states, past_key, past_value] + model.parameters()
             # return value of the dataflow block
             output = [o for o in output if o is not None]
             gv = bb.emit_output(output)
@@ -260,11 +262,21 @@ ex = relax.build(mod, target="cuda")
 vm = relax.VirtualMachine(ex, tvm.cuda())
 
 mod_th = BaichuanAttentionOriginal(BaichuanConfig())
-hidden_states_th = torch.randn(2, 4096, 5120)
+hidden_states_th = torch.randn(2, 1024, 5120)
+past_key_th = torch.randn(2, 40, 64, 128)
+past_value_th = torch.randn(2, 40, 64, 128)
+
 hidden_states_nd = tvm.nd.array(hidden_states_th.numpy(), device=tvm.cuda())
+past_key_nd = tvm.nd.array(past_key_th.numpy(), device=tvm.cuda())
+past_value_nd = tvm.nd.array(past_value_th.numpy(), device=tvm.cuda())
 w_pack_nd = tvm.nd.array(mod_th.W_pack.weight.detach().numpy(), device=tvm.cuda())
 o_proj_nd = tvm.nd.array(mod_th.o_proj.weight.detach().numpy(), device=tvm.cuda())
 
-print(mod_th(hidden_states_th, None, None))
-a=vm["main"](hidden_states_nd, w_pack_nd, o_proj_nd)
-print(a[0].numpy())
+attn_output, attn_weight, key_value =  mod_th(hidden_states_th, None, (past_key_th, past_value_th), use_cache=True)
+print(attn_output.shape)
+print(key_value[0].shape)
+print(key_value[1].shape)
+a=vm["main"](hidden_states_nd, past_key_nd, past_value_nd, w_pack_nd, o_proj_nd)
+print(a[0].numpy().shape)
+print(a[1][0].numpy().shape)
+print(a[1][1].numpy().shape)
