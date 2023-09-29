@@ -233,7 +233,7 @@ def build_relax(nn_module) -> tvm.ir.IRModule:
     # create a function called `linear` in the IRModule
     with bb.function("main"):
         # define input placeholder to the relax nn module
-        hidden_states = nn.Placeholder((2, 10, 5120), dtype="float32", name="hidden_states")
+        hidden_states = nn.Placeholder((2, 4096, 5120), dtype="float32", name="hidden_states")
         #attention_mask = nn.Placeholder((2, 4096, 4096), dtype="float32", name="attention_mask")
 
         # build dataflow block
@@ -253,17 +253,17 @@ mod = build_relax(BaichuanAttention)
 mod = relax.transform.LegalizeOps()(mod)
 mod.show()
 
-#with tvm.target.Target("cuda"):
-#    mod = tvm.tir.transform.DefaultGPUSchedule()(mod)
+with tvm.target.Target("cuda"):
+    mod = tvm.tir.transform.DefaultGPUSchedule()(mod)
 
-ex = relax.build(mod, target="llvm")
-vm = relax.VirtualMachine(ex, tvm.cpu())
+ex = relax.build(mod, target="cuda")
+vm = relax.VirtualMachine(ex, tvm.cuda())
 
 mod_th = BaichuanAttentionOriginal(BaichuanConfig())
-hidden_states_th = torch.randn(2, 10, 5120)
-hidden_states_nd = tvm.nd.array(hidden_states_th.numpy(), device=tvm.cpu())
-w_pack_nd = tvm.nd.array(mod_th.W_pack.weight.detach().numpy(), device=tvm.cpu())
-o_proj_nd = tvm.nd.array(mod_th.o_proj.weight.detach().numpy(), device=tvm.cpu())
+hidden_states_th = torch.randn(2, 4096, 5120)
+hidden_states_nd = tvm.nd.array(hidden_states_th.numpy(), device=tvm.cuda())
+w_pack_nd = tvm.nd.array(mod_th.W_pack.weight.detach().numpy(), device=tvm.cuda())
+o_proj_nd = tvm.nd.array(mod_th.o_proj.weight.detach().numpy(), device=tvm.cuda())
 
 print(mod_th(hidden_states_th, None, None))
 a=vm["main"](hidden_states_nd, w_pack_nd, o_proj_nd)
