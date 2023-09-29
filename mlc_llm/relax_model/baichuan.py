@@ -129,7 +129,38 @@ class BaichuanAttention(nn.Module):
             attn_weights = None
         return attn_output, attn_weights, past_key_value
 
+def _get_interleave(n):
+    def _get_interleave_power_of_2(n):
+        start = 2 ** (-(2 ** -(math.log2(n) - 3)))
+        ratio = start
+        return [start * ratio**i for i in range(n)]
 
+    if math.log2(n).is_integer():
+        return _get_interleave_power_of_2(n)
+    else:
+        closest_power_of_2 = 2 ** math.floor(math.log2(n))
+        return (
+            _get_interleave_power_of_2(closest_power_of_2)
+            + _get_interleave(2 * closest_power_of_2)[0::2][: n - closest_power_of_2]
+        )
+
+
+
+def _fill_with_neg_inf(t):
+    """FP16-compatible function that fills a tensor with -inf."""
+    return t.float().fill_(float("-inf")).type_as(t)
+
+def _gen_alibi_mask(tensor, n_head, max_pos):
+    slopes = torch.Tensor(_get_interleave(n_head))
+    position_point = torch.arange(max_pos) - max_pos + 1
+    position_point = position_point.unsqueeze(0).unsqueeze(0).expand(n_head, -1, -1)
+    diag = torch.diag(position_point[0])
+    position_point = position_point - diag.unsqueeze(0).unsqueeze(0).transpose(-1, -2)
+    alibi = slopes.unsqueeze(1).unsqueeze(1) * position_point
+    alibi = alibi.view(n_head, 1, max_pos)
+    alibi_mask = torch.triu(_fill_with_neg_inf(torch.zeros([max_pos, max_pos])), 1)
+    alibi_mask = alibi_mask.unsqueeze(0) + alibi
+    return alibi_mask
 
 class BaichuanAttentionOriginal(torch.nn.Module):
     def __init__(self, config: BaichuanConfig):
@@ -195,7 +226,6 @@ class BaichuanAttentionOriginal(torch.nn.Module):
             value_states = torch.cat([past_key_value[1], value_states], dim=2)
 
         past_key_value = (key_states, value_states) if use_cache else None
-
         attn_weights = torch.matmul(
             query_states, key_states.transpose(2, 3)
         ) / math.sqrt(self.head_dim)
@@ -236,20 +266,37 @@ def build_relax(nn_module) -> tvm.ir.IRModule:
         hidden_states = nn.Placeholder((2, 1024, 5120), dtype="float32", name="hidden_states")
         past_key = nn.Placeholder((2, 40, 64, 128), dtype="float32", name="past_key")
         past_value = nn.Placeholder((2, 40, 64, 128), dtype="float32", name="past_value")
-        #attention_mask = nn.Placeholder((2, 4096, 4096), dtype="float32", name="attention_mask")
+        attention_mask = nn.Placeholder((40, 1024, 1088), dtype="float32", name="attention_mask")
 
         # build dataflow block
         with bb.dataflow():
             # call forward function of relax nn module to build IRModule
-            output = model(hidden_states, None, (past_key, past_value), use_cache=True)
+            output = model(hidden_states, attention_mask, (past_key, past_value), use_cache=True, output_attentions=True)
             # The params of the constructed IRModule
-            params = [hidden_states, past_key, past_value] + model.parameters()
+            params = [hidden_states, attention_mask, past_key, past_value] + model.parameters()
             # return value of the dataflow block
             output = [o for o in output if o is not None]
             gv = bb.emit_output(output)
         # return value and params of the Relax function `linear`
         bb.emit_func_output(gv, params)
     return bb.get()
+
+
+
+mod_th = BaichuanAttentionOriginal(BaichuanConfig())
+hidden_states_th = torch.randn(2, 1024, 5120)
+alibi = _gen_alibi_mask(hidden_states_th, 40, 1088)
+attention_mask = alibi[:, :1024, :1088]
+print("attention_mask.shape", attention_mask.shape)
+
+past_key_th = torch.randn(2, 40, 64, 128)
+past_value_th = torch.randn(2, 40, 64, 128)
+attn_output, attn_weight, key_value =  mod_th(hidden_states_th, attention_mask, (past_key_th, past_value_th), use_cache=True, output_attentions=True)
+print("attn_output.shape", attn_output.shape)
+print("attn_weight.shape", attn_weight.shape)
+print("past_key.shape", key_value[0].shape)
+print("past_value.shape", key_value[1].shape)
+
 
 mod = build_relax(BaichuanAttention)
 mod = relax.transform.LegalizeOps()(mod)
@@ -261,22 +308,18 @@ with tvm.target.Target("cuda"):
 ex = relax.build(mod, target="cuda")
 vm = relax.VirtualMachine(ex, tvm.cuda())
 
-mod_th = BaichuanAttentionOriginal(BaichuanConfig())
-hidden_states_th = torch.randn(2, 1024, 5120)
-past_key_th = torch.randn(2, 40, 64, 128)
-past_value_th = torch.randn(2, 40, 64, 128)
-
 hidden_states_nd = tvm.nd.array(hidden_states_th.numpy(), device=tvm.cuda())
+attention_mask_nd = tvm.nd.array(attention_mask.numpy(), device=tvm.cuda())
 past_key_nd = tvm.nd.array(past_key_th.numpy(), device=tvm.cuda())
 past_value_nd = tvm.nd.array(past_value_th.numpy(), device=tvm.cuda())
 w_pack_nd = tvm.nd.array(mod_th.W_pack.weight.detach().numpy(), device=tvm.cuda())
 o_proj_nd = tvm.nd.array(mod_th.o_proj.weight.detach().numpy(), device=tvm.cuda())
 
-attn_output, attn_weight, key_value =  mod_th(hidden_states_th, None, (past_key_th, past_value_th), use_cache=True)
-print(attn_output.shape)
-print(key_value[0].shape)
-print(key_value[1].shape)
-a=vm["main"](hidden_states_nd, past_key_nd, past_value_nd, w_pack_nd, o_proj_nd)
+
+a=vm["main"](hidden_states_nd, attention_mask_nd, past_key_nd, past_value_nd, w_pack_nd, o_proj_nd)
 print(a[0].numpy().shape)
-print(a[1][0].numpy().shape)
-print(a[1][1].numpy().shape)
+print(a[1].numpy().shape)
+print(a[2][0].numpy().shape)
+print(a[2][1].numpy().shape)
+
+
