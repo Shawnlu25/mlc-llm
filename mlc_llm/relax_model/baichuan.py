@@ -80,7 +80,6 @@ class BaichuanAttention(nn.Module):
         key_states = relax.TupleGetItem(qkv_states, 1)
         value_states = relax.TupleGetItem(qkv_states, 2)
         
-        
         query_states = nn.emit(relax.op.permute_dims(relax.op.reshape(query_states, (bsz, q_len, self.num_heads, self.head_dim)), [0,2,1,3])) # [bsz, num_query_heads, q_len, head_dim]
         key_states = nn.emit(relax.op.permute_dims(relax.op.reshape(key_states, (bsz, q_len, self.num_heads, self.head_dim)), [0,2,1,3]))
         value_states = nn.emit(relax.op.permute_dims(relax.op.reshape(value_states, (bsz, q_len, self.num_heads, self.head_dim)), [0,2,1,3]))
@@ -129,6 +128,39 @@ class BaichuanAttention(nn.Module):
             attn_weights = None
         return attn_output, attn_weights, past_key_value
 
+
+class BaichuanLayer(nn.Module):
+    def __init__(self, config: BaichuanConfig):
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.self_attn = BaichuanAttention(config)
+        self.mlp = BaichuanMLP(config.hidden_size, config.intermediate_size)
+        self.input_layernorm = BaichuanRMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.post_attention_layernorm = BaichuanRMSNorm(config.hidden_size, config.rms_norm_eps)
+    
+    def forward(self, 
+                hidden_states: relax.Expr,
+                attention_mask: Optional[relax.Expr] = None,
+                past_key_value: Optional[Tuple[relax.Expr]] = None,
+                output_attentions: Optional[bool] = False,
+                use_cache: Optional[bool] = False,
+                ) -> Tuple[relax.Expr, Optional[Tuple[relax.Expr, relax.Expr]]]:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states, self_attn_weights, present_key_value = self.self_attn(hidden_states, attention_mask, past_key_value, output_attentions, use_cache)
+        hidden_states = nn.emit(residual + hidden_states)
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = nn.emit(residual + self.mlp(hidden_states))
+
+        outputs = (hidden_states, )
+        if use_cache:
+            outputs += (present_key_value, )
+        return outputs
+
+
+
 def _get_interleave(n):
     def _get_interleave_power_of_2(n):
         start = 2 ** (-(2 ** -(math.log2(n) - 3)))
@@ -143,8 +175,6 @@ def _get_interleave(n):
             _get_interleave_power_of_2(closest_power_of_2)
             + _get_interleave(2 * closest_power_of_2)[0::2][: n - closest_power_of_2]
         )
-
-
 
 def _fill_with_neg_inf(t):
     """FP16-compatible function that fills a tensor with -inf."""
